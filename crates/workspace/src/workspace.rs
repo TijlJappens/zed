@@ -2987,7 +2987,10 @@ impl Workspace {
                 }
             }));
 
-        if let Err(error) = auxiliary_window.update(cx, |_, window, _| window.activate_window()) {
+        if let Err(error) = auxiliary_window.update(cx, |auxiliary_window, window, cx| {
+            window.activate_window();
+            window.focus(&auxiliary_window.pane().focus_handle(cx), cx);
+        }) {
             self.mark_auxiliary_workspace_window_closed(auxiliary_window_id);
             return Err(error);
         }
@@ -8790,6 +8793,12 @@ impl Workspace {
             .root::<MultiWorkspace>()
             .flatten()
             .map(|multi_workspace| multi_workspace.read(cx).workspace().clone())
+            .or_else(|| {
+                window
+                    .root::<AuxiliaryWorkspaceWindow>()
+                    .flatten()
+                    .and_then(|auxiliary_window| auxiliary_window.read(cx).workspace())
+            })
     }
 
     pub fn zoomed_item(&self) -> Option<&AnyWeakView> {
@@ -12236,7 +12245,12 @@ fn load_legacy_panel_size(
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+        sync::Arc,
+        time::Duration,
+    };
 
     use super::*;
     use crate::{
@@ -12250,14 +12264,16 @@ mod tests {
     };
     use fs::FakeFs;
     use gpui::{
-        DismissEvent, Empty, EventEmitter, FocusHandle, Focusable, Render, TestAppContext,
-        UpdateGlobal, VisualTestContext, px,
+        DismissEvent, Empty, EventEmitter, FocusHandle, Focusable, Modifiers, MouseButton,
+        MouseDownEvent, MouseUpEvent, Render, TestAppContext, UpdateGlobal, VisualTestContext, px,
     };
     use project::{Project, ProjectEntryId, WorktreeId};
     use serde_json::json;
     use settings::SettingsStore;
     use util::path;
     use util::rel_path::rel_path;
+
+    gpui::actions!(workspace_tests, [TestAuxiliaryWorkspaceAction]);
 
     #[test]
     fn test_workspace_windows_expose_only_open_destinations_in_stable_order() {
@@ -12356,9 +12372,24 @@ mod tests {
 
         let fs = FakeFs::new(cx.executor());
         let project = Project::test(fs, [], cx).await;
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
         let main_window_handle = cx.window_handle();
+        let action_count = Rc::new(Cell::new(0));
+        workspace.update(cx, {
+            let action_count = action_count.clone();
+            move |workspace, _| {
+                workspace.register_action(move |_, _: &TestAuxiliaryWorkspaceAction, _, _| {
+                    action_count.set(action_count.get() + 1)
+                });
+            }
+        });
+        assert_eq!(
+            cx.update(|window, cx| Workspace::for_window(window, cx)),
+            Some(workspace.clone())
+        );
 
         let auxiliary_window = match workspace.update(cx, |workspace, cx| {
             workspace.open_auxiliary_workspace_window(cx)
@@ -12369,20 +12400,69 @@ mod tests {
         cx.run_until_parked();
 
         assert_eq!(cx.update(|_, cx| cx.windows().len()), 2);
-        let (auxiliary_workspace, auxiliary_project, auxiliary_window_id) = match auxiliary_window
-            .update(cx, |auxiliary_window, _, cx| {
+        let (auxiliary_workspace, auxiliary_project, auxiliary_window_id, auxiliary_pane) =
+            match auxiliary_window.update(cx, |auxiliary_window, _, cx| {
                 (
                     auxiliary_window.workspace(),
                     auxiliary_window.project(cx),
                     auxiliary_window.id(),
+                    auxiliary_window.pane().clone(),
                 )
             }) {
-            Ok(auxiliary_state) => auxiliary_state,
-            Err(error) => panic!("failed to read auxiliary workspace window: {error:#}"),
-        };
+                Ok(auxiliary_state) => auxiliary_state,
+                Err(error) => panic!("failed to read auxiliary workspace window: {error:#}"),
+            };
         assert_eq!(auxiliary_workspace, Some(workspace.clone()));
         assert_eq!(auxiliary_project, Some(project));
         assert_eq!(auxiliary_window_id, AuxiliaryWorkspaceWindowId(0));
+        let auxiliary_workspace_for_window = match cx
+            .update_window(auxiliary_window.into(), |_, window, cx| {
+                Workspace::for_window(window, cx)
+            }) {
+            Ok(workspace) => workspace,
+            Err(error) => panic!("failed to resolve auxiliary workspace: {error:#}"),
+        };
+        assert_eq!(auxiliary_workspace_for_window, Some(workspace.clone()));
+
+        if let Err(error) = cx.update_window(auxiliary_window.into(), |_, window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+            window.dispatch_action(TestAuxiliaryWorkspaceAction.boxed_clone(), cx)
+        }) {
+            panic!("failed to dispatch auxiliary workspace action: {error:#}");
+        }
+        assert_eq!(action_count.get(), 1);
+
+        if let Err(error) = auxiliary_window.update(cx, |_, window, cx| {
+            let item = cx.new(TestItem::new);
+            auxiliary_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(item), true, true, None, window, cx)
+            });
+        }) {
+            panic!("failed to add an auxiliary pane item: {error:#}");
+        }
+        let mut auxiliary_cx = VisualTestContext::from_window(auxiliary_window.into(), &cx.cx);
+        auxiliary_cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let Some(tab_bounds) = auxiliary_cx.debug_bounds("TAB-0") else {
+            panic!("auxiliary tab should have debug bounds");
+        };
+        auxiliary_cx.simulate_event(MouseDownEvent {
+            position: tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        auxiliary_cx.simulate_event(MouseUpEvent {
+            position: tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+
         assert_eq!(
             workspace.read_with(cx, |workspace, _| workspace.workspace_window_destinations()),
             vec![

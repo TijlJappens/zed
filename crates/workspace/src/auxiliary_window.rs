@@ -7,6 +7,7 @@ pub struct AuxiliaryWorkspaceWindow {
     workspace: WeakEntity<Workspace>,
     pane: Entity<Pane>,
     id: AuxiliaryWorkspaceWindowId,
+    workspace_integration_ready: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -32,7 +33,9 @@ impl AuxiliaryWorkspaceWindow {
         cx.defer_in(window, {
             let workspace = workspace.clone();
             let pane = pane.clone();
-            move |_, _, cx| {
+            move |this, _, cx| {
+                this.workspace_integration_ready = true;
+                cx.notify();
                 if let Some(workspace) = workspace.upgrade() {
                     workspace.update(cx, |_, cx| {
                         cx.emit(WorkspaceEvent::PaneAdded(pane));
@@ -45,6 +48,7 @@ impl AuxiliaryWorkspaceWindow {
             workspace,
             pane,
             id,
+            workspace_integration_ready: false,
             _subscriptions: vec![pane_event_subscription],
         }
     }
@@ -67,12 +71,28 @@ impl AuxiliaryWorkspaceWindow {
 }
 
 impl Render for AuxiliaryWorkspaceWindow {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .id(("auxiliary-workspace-window", self.id.number()))
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.workspace_integration_ready {
+            return div()
+                .id(("auxiliary-workspace-window", self.id.number()))
+                .size_full()
+                .child(self.pane.clone())
+                .into_any_element();
+        }
+        let Some(workspace) = self.workspace.upgrade() else {
+            return div().size_full().into_any_element();
+        };
+        let workspace_key_context =
+            workspace.read_with(cx, |workspace, cx| workspace.key_context(cx));
+        let root = workspace.update(cx, |workspace, cx| workspace.actions(h_flex(), window, cx));
+
+        root.id(("auxiliary-workspace-window", self.id.number()))
+            .key_context(workspace_key_context)
+            .relative()
             .size_full()
-            .when(self.workspace.upgrade().is_some(), |this| {
-                this.child(self.pane.clone())
-            })
+            .font(theme_settings::setup_ui_font(window, cx))
+            .text_color(cx.theme().colors().text)
+            .child(self.pane.clone())
+            .into_any_element()
     }
 }
