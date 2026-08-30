@@ -1,4 +1,5 @@
 pub mod active_file_name;
+mod auxiliary_window;
 pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
@@ -29,6 +30,7 @@ pub mod welcome;
 pub mod workspace_error;
 mod workspace_settings;
 
+pub use auxiliary_window::AuxiliaryWorkspaceWindow;
 pub use dock::Panel;
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectDown,
@@ -65,8 +67,8 @@ use gpui::{
     DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior,
     Hsla, KeyContext, Keystroke, ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel,
     Render, ResizeEdge, Size, Stateful, Subscription, SystemWindowTabController, Task, TaskExt,
-    Tiling, WeakEntity, WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas,
-    point, relative, size, transparent_black,
+    Tiling, WeakEntity, WindowBounds, WindowHandle, WindowId, WindowKind, WindowOptions, actions,
+    canvas, point, relative, size, transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
@@ -788,10 +790,8 @@ enum AuxiliaryWindowSlot {
     Closed,
 }
 
-// TODO(auxiliary-windows): Once auxiliary native windows are created, only accept handles whose
-// root is `AuxiliaryWorkspaceWindow`, wire the GPUI close callback to transition the matching slot
-// to `Closed`, and treat a failed update through an `Open` handle as a close race rather than as an
-// invariant violation.
+// TODO(auxiliary-windows): Treat a failed update through an `Open` handle as a close race rather
+// than as an invariant violation.
 struct WorkspaceWindows {
     main_window: AnyWindowHandle,
     auxiliary_windows: Vec<AuxiliaryWindowSlot>,
@@ -816,7 +816,10 @@ impl WorkspaceWindows {
         id: AuxiliaryWorkspaceWindowId,
         window_handle: AnyWindowHandle,
     ) -> bool {
-        if window_handle.window_id() == self.main_window.window_id()
+        if window_handle
+            .downcast::<AuxiliaryWorkspaceWindow>()
+            .is_none()
+            || window_handle.window_id() == self.main_window.window_id()
             || self.auxiliary_windows.iter().any(|slot| {
                 matches!(
                     slot,
@@ -2902,6 +2905,94 @@ impl Workspace {
         id: AuxiliaryWorkspaceWindowId,
     ) -> bool {
         self.workspace_windows.mark_auxiliary_window_closed(id)
+    }
+
+    pub fn open_auxiliary_workspace_window(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Result<WindowHandle<AuxiliaryWorkspaceWindow>> {
+        let auxiliary_window_id = self
+            .allocate_auxiliary_workspace_window_id()
+            .context("auxiliary workspace window ID exceeds the supported range")?;
+        let mut options = (self.app_state.build_window_options)(None, cx);
+        options.titlebar = None;
+        options.tabbing_identifier = None;
+        options.kind = WindowKind::Normal;
+        options.focus = true;
+        options.show = true;
+
+        let workspace = self.weak_handle();
+        let project = self.project.clone();
+        let pane_history_timestamp = self.pane_history_timestamp.clone();
+        let open_result = cx.open_window(options, move |window, cx| {
+            let pane = cx.new(|cx| {
+                let mut pane = Pane::new(
+                    workspace.clone(),
+                    project,
+                    pane_history_timestamp,
+                    None,
+                    NewFile.boxed_clone(),
+                    true,
+                    window,
+                    cx,
+                );
+                pane.set_close_pane_if_empty(false, cx);
+                pane
+            });
+            cx.new(|cx| {
+                AuxiliaryWorkspaceWindow::new(workspace, pane, auxiliary_window_id, window, cx)
+            })
+        });
+
+        let auxiliary_window = match open_result {
+            Ok(auxiliary_window) => auxiliary_window,
+            Err(error) => {
+                self.mark_auxiliary_workspace_window_closed(auxiliary_window_id);
+                return Err(error);
+            }
+        };
+        let window_handle = auxiliary_window.into();
+        if !self.register_auxiliary_workspace_window(auxiliary_window_id, window_handle) {
+            self.mark_auxiliary_workspace_window_closed(auxiliary_window_id);
+            auxiliary_window
+                .update(cx, |_, window, _| window.remove_window())
+                .log_err();
+            return Err(anyhow!("failed to register auxiliary workspace window"));
+        }
+
+        let pane = match auxiliary_window
+            .update(cx, |auxiliary_window, _, _| auxiliary_window.pane().clone())
+        {
+            Ok(pane) => pane,
+            Err(error) => {
+                self.mark_auxiliary_workspace_window_closed(auxiliary_window_id);
+                return Err(error);
+            }
+        };
+        self.panes.push(pane);
+
+        let workspace = self.weak_handle();
+        let native_window_id = window_handle.window_id();
+        self._subscriptions
+            .push(cx.on_window_closed(move |cx, closed_window_id| {
+                if closed_window_id != native_window_id {
+                    return;
+                }
+                if let Some(workspace) = workspace.upgrade() {
+                    workspace.update(cx, |workspace, cx| {
+                        if workspace.mark_auxiliary_workspace_window_closed(auxiliary_window_id) {
+                            cx.notify();
+                        }
+                    });
+                }
+            }));
+
+        if let Err(error) = auxiliary_window.update(cx, |_, window, _| window.activate_window()) {
+            self.mark_auxiliary_workspace_window_closed(auxiliary_window_id);
+            return Err(error);
+        }
+
+        Ok(auxiliary_window)
     }
 
     pub fn path_style(&self, cx: &App) -> PathStyle {
@@ -12170,8 +12261,9 @@ mod tests {
 
     #[test]
     fn test_workspace_windows_expose_only_open_destinations_in_stable_order() {
-        let test_window_handle =
-            |id| -> AnyWindowHandle { WindowHandle::<Empty>::new(WindowId::from(id)).into() };
+        let test_window_handle = |id| -> AnyWindowHandle {
+            WindowHandle::<AuxiliaryWorkspaceWindow>::new(WindowId::from(id)).into()
+        };
         let main_window = test_window_handle(10);
         let first_auxiliary_window = test_window_handle(11);
         let second_auxiliary_window = test_window_handle(12);
@@ -12255,6 +12347,75 @@ mod tests {
         assert!(
             !workspace_windows
                 .register_auxiliary_window(third_auxiliary_id, second_auxiliary_window,)
+        );
+    }
+
+    #[gpui::test]
+    async fn test_open_auxiliary_workspace_window(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+        let main_window_handle = cx.window_handle();
+
+        let auxiliary_window = match workspace.update(cx, |workspace, cx| {
+            workspace.open_auxiliary_workspace_window(cx)
+        }) {
+            Ok(auxiliary_window) => auxiliary_window,
+            Err(error) => panic!("failed to open auxiliary workspace window: {error:#}"),
+        };
+        cx.run_until_parked();
+
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), 2);
+        let (auxiliary_workspace, auxiliary_project, auxiliary_window_id) = match auxiliary_window
+            .update(cx, |auxiliary_window, _, cx| {
+                (
+                    auxiliary_window.workspace(),
+                    auxiliary_window.project(cx),
+                    auxiliary_window.id(),
+                )
+            }) {
+            Ok(auxiliary_state) => auxiliary_state,
+            Err(error) => panic!("failed to read auxiliary workspace window: {error:#}"),
+        };
+        assert_eq!(auxiliary_workspace, Some(workspace.clone()));
+        assert_eq!(auxiliary_project, Some(project));
+        assert_eq!(auxiliary_window_id, AuxiliaryWorkspaceWindowId(0));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.workspace_window_destinations()),
+            vec![
+                WorkspaceWindowDestination {
+                    id: WorkspaceWindowId::Main,
+                    window_handle: main_window_handle,
+                    label: "Main Window".to_owned(),
+                },
+                WorkspaceWindowDestination {
+                    id: WorkspaceWindowId::Auxiliary(auxiliary_window_id),
+                    window_handle: auxiliary_window.into(),
+                    label: "Window 0".to_owned(),
+                },
+            ]
+        );
+
+        if let Err(error) = auxiliary_window.update(cx, |_, window, _| window.remove_window()) {
+            panic!("failed to close auxiliary workspace window: {error:#}");
+        }
+        cx.run_until_parked();
+
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.workspace_window_destinations()),
+            vec![WorkspaceWindowDestination {
+                id: WorkspaceWindowId::Main,
+                window_handle: main_window_handle,
+                label: "Main Window".to_owned(),
+            }]
+        );
+        assert_eq!(
+            workspace.update(cx, |workspace, _| workspace
+                .allocate_auxiliary_workspace_window_id()),
+            Some(AuxiliaryWorkspaceWindowId(1))
         );
     }
 

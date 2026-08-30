@@ -629,6 +629,10 @@ impl Pane {
         }
     }
 
+    pub(crate) fn project(&self) -> Option<Entity<Project>> {
+        self.project.upgrade()
+    }
+
     fn alternate_file(&mut self, _: &AlternateFile, window: &mut Window, cx: &mut Context<Pane>) {
         let (_, alternative) = &self.alternate_file_items;
         if let Some(alternative) = alternative {
