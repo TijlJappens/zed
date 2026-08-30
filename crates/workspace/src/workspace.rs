@@ -60,13 +60,13 @@ use futures::{
     future::{Shared, try_join_all},
 };
 use gpui::{
-    Action, AnyEntity, AnyView, AnyWeakView, App, AppContext, AsyncApp, AsyncWindowContext, Axis,
-    Bounds, ClipboardItem, Context, CursorStyle, Decorations, DragMoveEvent, Entity, EntityId,
-    EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior, Hsla, KeyContext, Keystroke,
-    ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel, Render, ResizeEdge, Size,
-    Stateful, Subscription, SystemWindowTabController, Task, TaskExt, Tiling, WeakEntity,
-    WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas, point, relative, size,
-    transparent_black,
+    Action, AnyEntity, AnyView, AnyWeakView, AnyWindowHandle, App, AppContext, AsyncApp,
+    AsyncWindowContext, Axis, Bounds, ClipboardItem, Context, CursorStyle, Decorations,
+    DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable, Global, HitboxBehavior,
+    Hsla, KeyContext, Keystroke, ManagedView, MouseButton, PathPromptOptions, Point, PromptLevel,
+    Render, ResizeEdge, Size, Stateful, Subscription, SystemWindowTabController, Task, TaskExt,
+    Tiling, WeakEntity, WindowBounds, WindowHandle, WindowId, WindowOptions, actions, canvas,
+    point, relative, size, transparent_black,
 };
 pub use history_manager::*;
 pub use item::{
@@ -747,6 +747,135 @@ impl Column for WorkspaceId {
 impl From<WorkspaceId> for i64 {
     fn from(val: WorkspaceId) -> Self {
         val.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AuxiliaryWorkspaceWindowId(u64);
+
+impl AuxiliaryWorkspaceWindowId {
+    pub fn number(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum WorkspaceWindowId {
+    Main,
+    Auxiliary(AuxiliaryWorkspaceWindowId),
+}
+
+impl WorkspaceWindowId {
+    pub fn label(self) -> String {
+        match self {
+            Self::Main => "Main Window".to_owned(),
+            Self::Auxiliary(id) => format!("Window {}", id.number()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceWindowDestination {
+    pub id: WorkspaceWindowId,
+    pub window_handle: AnyWindowHandle,
+    pub label: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuxiliaryWindowSlot {
+    Pending,
+    Open(AnyWindowHandle),
+    Closed,
+}
+
+// TODO(auxiliary-windows): Once auxiliary native windows are created, only accept handles whose
+// root is `AuxiliaryWorkspaceWindow`, wire the GPUI close callback to transition the matching slot
+// to `Closed`, and treat a failed update through an `Open` handle as a close race rather than as an
+// invariant violation.
+struct WorkspaceWindows {
+    main_window: AnyWindowHandle,
+    auxiliary_windows: Vec<AuxiliaryWindowSlot>,
+}
+
+impl WorkspaceWindows {
+    fn new(main_window: AnyWindowHandle) -> Self {
+        Self {
+            main_window,
+            auxiliary_windows: Vec::new(),
+        }
+    }
+
+    fn allocate_auxiliary_window_id(&mut self) -> Option<AuxiliaryWorkspaceWindowId> {
+        let number = u64::try_from(self.auxiliary_windows.len()).ok()?;
+        self.auxiliary_windows.push(AuxiliaryWindowSlot::Pending);
+        Some(AuxiliaryWorkspaceWindowId(number))
+    }
+
+    fn register_auxiliary_window(
+        &mut self,
+        id: AuxiliaryWorkspaceWindowId,
+        window_handle: AnyWindowHandle,
+    ) -> bool {
+        if window_handle.window_id() == self.main_window.window_id()
+            || self.auxiliary_windows.iter().any(|slot| {
+                matches!(
+                    slot,
+                    AuxiliaryWindowSlot::Open(existing_handle)
+                        if existing_handle.window_id() == window_handle.window_id()
+                )
+            })
+        {
+            return false;
+        }
+        let Ok(index) = usize::try_from(id.number()) else {
+            return false;
+        };
+        let Some(slot @ AuxiliaryWindowSlot::Pending) = self.auxiliary_windows.get_mut(index)
+        else {
+            return false;
+        };
+        *slot = AuxiliaryWindowSlot::Open(window_handle);
+        true
+    }
+
+    fn mark_auxiliary_window_closed(&mut self, id: AuxiliaryWorkspaceWindowId) -> bool {
+        let Ok(index) = usize::try_from(id.number()) else {
+            return false;
+        };
+        let Some(slot) = self.auxiliary_windows.get_mut(index) else {
+            return false;
+        };
+        if *slot == AuxiliaryWindowSlot::Closed {
+            return false;
+        }
+        *slot = AuxiliaryWindowSlot::Closed;
+        true
+    }
+
+    fn destinations(&self) -> Vec<WorkspaceWindowDestination> {
+        std::iter::once(WorkspaceWindowDestination {
+            id: WorkspaceWindowId::Main,
+            window_handle: self.main_window,
+            label: WorkspaceWindowId::Main.label(),
+        })
+        .chain(
+            self.auxiliary_windows
+                .iter()
+                .enumerate()
+                .filter_map(|(number, slot)| {
+                    let AuxiliaryWindowSlot::Open(window_handle) = slot else {
+                        return None;
+                    };
+                    let number = u64::try_from(number).ok()?;
+                    let id = WorkspaceWindowId::Auxiliary(AuxiliaryWorkspaceWindowId(number));
+                    Some(WorkspaceWindowDestination {
+                        id,
+                        window_handle: *window_handle,
+                        label: id.label(),
+                    })
+                }),
+        )
+        .collect()
     }
 }
 
@@ -1456,6 +1585,7 @@ pub struct Workspace {
     panes: Vec<Entity<Pane>>,
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
+    workspace_windows: WorkspaceWindows,
     last_active_center_pane: Option<WeakEntity<Pane>>,
     last_active_view_id: Option<proto::ViewId>,
     status_bar: Entity<StatusBar>,
@@ -1924,6 +2054,7 @@ impl Workspace {
             panes: vec![center_pane.clone()],
             panes_by_item: Default::default(),
             active_pane: center_pane.clone(),
+            workspace_windows: WorkspaceWindows::new(window.window_handle()),
             last_active_center_pane: Some(center_pane.downgrade()),
             last_active_view_id: None,
             status_bar,
@@ -2747,6 +2878,30 @@ impl Workspace {
 
     pub fn project(&self) -> &Entity<Project> {
         &self.project
+    }
+
+    pub fn workspace_window_destinations(&self) -> Vec<WorkspaceWindowDestination> {
+        self.workspace_windows.destinations()
+    }
+
+    pub fn allocate_auxiliary_workspace_window_id(&mut self) -> Option<AuxiliaryWorkspaceWindowId> {
+        self.workspace_windows.allocate_auxiliary_window_id()
+    }
+
+    pub fn register_auxiliary_workspace_window(
+        &mut self,
+        id: AuxiliaryWorkspaceWindowId,
+        window_handle: AnyWindowHandle,
+    ) -> bool {
+        self.workspace_windows
+            .register_auxiliary_window(id, window_handle)
+    }
+
+    pub fn mark_auxiliary_workspace_window_closed(
+        &mut self,
+        id: AuxiliaryWorkspaceWindowId,
+    ) -> bool {
+        self.workspace_windows.mark_auxiliary_window_closed(id)
     }
 
     pub fn path_style(&self, cx: &App) -> PathStyle {
@@ -12012,6 +12167,96 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
     use util::rel_path::rel_path;
+
+    #[test]
+    fn test_workspace_windows_expose_only_open_destinations_in_stable_order() {
+        let test_window_handle =
+            |id| -> AnyWindowHandle { WindowHandle::<Empty>::new(WindowId::from(id)).into() };
+        let main_window = test_window_handle(10);
+        let first_auxiliary_window = test_window_handle(11);
+        let second_auxiliary_window = test_window_handle(12);
+        let mut workspace_windows = WorkspaceWindows::new(main_window);
+        let first_auxiliary_id = AuxiliaryWorkspaceWindowId(0);
+        let second_auxiliary_id = AuxiliaryWorkspaceWindowId(1);
+
+        assert_eq!(
+            workspace_windows.allocate_auxiliary_window_id(),
+            Some(first_auxiliary_id)
+        );
+        assert_eq!(
+            workspace_windows.allocate_auxiliary_window_id(),
+            Some(second_auxiliary_id)
+        );
+        assert_eq!(
+            workspace_windows.destinations(),
+            vec![WorkspaceWindowDestination {
+                id: WorkspaceWindowId::Main,
+                window_handle: main_window,
+                label: "Main Window".to_owned(),
+            }]
+        );
+
+        assert!(
+            workspace_windows
+                .register_auxiliary_window(second_auxiliary_id, second_auxiliary_window,)
+        );
+        assert!(
+            workspace_windows
+                .register_auxiliary_window(first_auxiliary_id, first_auxiliary_window,)
+        );
+        assert_eq!(
+            workspace_windows.destinations(),
+            vec![
+                WorkspaceWindowDestination {
+                    id: WorkspaceWindowId::Main,
+                    window_handle: main_window,
+                    label: "Main Window".to_owned(),
+                },
+                WorkspaceWindowDestination {
+                    id: WorkspaceWindowId::Auxiliary(first_auxiliary_id),
+                    window_handle: first_auxiliary_window,
+                    label: "Window 0".to_owned(),
+                },
+                WorkspaceWindowDestination {
+                    id: WorkspaceWindowId::Auxiliary(second_auxiliary_id),
+                    window_handle: second_auxiliary_window,
+                    label: "Window 1".to_owned(),
+                },
+            ]
+        );
+
+        assert!(workspace_windows.mark_auxiliary_window_closed(first_auxiliary_id));
+        assert!(
+            !workspace_windows
+                .register_auxiliary_window(first_auxiliary_id, test_window_handle(13),)
+        );
+        assert_eq!(
+            workspace_windows.destinations(),
+            vec![
+                WorkspaceWindowDestination {
+                    id: WorkspaceWindowId::Main,
+                    window_handle: main_window,
+                    label: "Main Window".to_owned(),
+                },
+                WorkspaceWindowDestination {
+                    id: WorkspaceWindowId::Auxiliary(second_auxiliary_id),
+                    window_handle: second_auxiliary_window,
+                    label: "Window 1".to_owned(),
+                },
+            ]
+        );
+
+        let third_auxiliary_id = AuxiliaryWorkspaceWindowId(2);
+        assert_eq!(
+            workspace_windows.allocate_auxiliary_window_id(),
+            Some(third_auxiliary_id)
+        );
+        assert!(!workspace_windows.register_auxiliary_window(third_auxiliary_id, main_window,));
+        assert!(
+            !workspace_windows
+                .register_auxiliary_window(third_auxiliary_id, second_auxiliary_window,)
+        );
+    }
 
     #[gpui::test]
     async fn test_tab_disambiguation(cx: &mut TestAppContext) {
