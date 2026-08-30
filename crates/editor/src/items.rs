@@ -862,6 +862,22 @@ impl Item for Editor {
         true
     }
 
+    fn can_move_to_window(&self) -> bool {
+        true
+    }
+
+    fn clone_for_window(
+        &self,
+        _workspace_id: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Entity<Editor>>>>
+    where
+        Self: Sized,
+    {
+        Task::ready(Ok(Some(cx.new(|cx| self.clone(window, cx)))))
+    }
+
     fn clone_on_split(
         &self,
         _workspace_id: Option<WorkspaceId>,
@@ -2619,6 +2635,60 @@ mod tests {
                 window[0], window[1],
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_clone_for_window_shares_editor_model(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let buffer = cx.update(|cx| {
+            let buffer = cx.new(|cx| Buffer::local("saved contents", cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(0..0, "unsaved ")], None, cx);
+            });
+            buffer
+        });
+        let (editor, cx) = cx.add_window_view({
+            let buffer = buffer.clone();
+            let project = project.clone();
+            move |window, cx| Editor::for_buffer(buffer, Some(project), window, cx)
+        });
+
+        assert!(
+            cx.update(|_, cx| { workspace::item::ItemHandle::can_move_to_window(&editor, cx) })
+        );
+        let destination_window = cx
+            .update(|_, cx| {
+                cx.open_window(Default::default(), |window, cx| {
+                    cx.new(|cx| {
+                        let buffer = MultiBuffer::build_simple("", cx);
+                        Editor::for_multibuffer(buffer, None, window, cx)
+                    })
+                })
+            })
+            .expect("failed to open destination window");
+        let clone_task = destination_window
+            .update(cx, |_, window, cx| {
+                workspace::item::ItemHandle::clone_for_window(&editor, None, window, cx)
+            })
+            .expect("destination window closed before cloning");
+        let cloned_editor = clone_task
+            .await
+            .expect("failed to clone editor for destination window")
+            .expect("editor unexpectedly reported window cloning as unsupported")
+            .downcast::<Editor>()
+            .expect("cloned item was not an editor");
+
+        cx.update(|_, cx| {
+            assert_eq!(cloned_editor.read(cx).buffer(), editor.read(cx).buffer());
+            assert_eq!(cloned_editor.read(cx).project(), Some(&project));
+            assert_eq!(
+                cloned_editor.read(cx).buffer().read(cx).snapshot(cx).text(),
+                "unsaved saved contents"
+            );
+        });
     }
 
     #[gpui::test]

@@ -264,6 +264,24 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     fn can_split(&self) -> bool {
         false
     }
+
+    fn can_move_to_window(&self) -> bool {
+        false
+    }
+
+    fn clone_for_window(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<Entity<Self>>>>
+    where
+        Self: Sized,
+    {
+        _ = (workspace_id, window, cx);
+        Task::ready(Ok(None))
+    }
+
     fn clone_on_split(
         &self,
         workspace_id: Option<WorkspaceId>,
@@ -506,6 +524,13 @@ pub trait ItemHandle: 'static + Send {
     fn buffer_kind(&self, cx: &App) -> ItemBufferKind;
     fn boxed_clone(&self) -> Box<dyn ItemHandle>;
     fn can_split(&self, cx: &App) -> bool;
+    fn can_move_to_window(&self, cx: &App) -> bool;
+    fn clone_for_window(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Option<Box<dyn ItemHandle>>>>;
     fn clone_on_split(
         &self,
         workspace_id: Option<WorkspaceId>,
@@ -729,6 +754,25 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn can_split(&self, cx: &App) -> bool {
         self.read(cx).can_split()
+    }
+
+    fn can_move_to_window(&self, cx: &App) -> bool {
+        self.read(cx).can_move_to_window()
+    }
+
+    fn clone_for_window(
+        &self,
+        workspace_id: Option<WorkspaceId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<Option<Box<dyn ItemHandle>>>> {
+        let task = self.update(cx, |item, cx| {
+            item.clone_for_window(workspace_id, window, cx)
+        });
+        cx.background_spawn(async move {
+            task.await
+                .map(|handle| handle.map(|handle| Box::new(handle) as Box<dyn ItemHandle>))
+        })
     }
 
     fn clone_on_split(
