@@ -2506,7 +2506,7 @@ fn compute_modified_ranges(
 mod tests {
     use crate::editor_tests::init_test;
     use fs::Fs;
-    use workspace::MultiWorkspace;
+    use workspace::{MultiWorkspace, WorkspaceWindowId};
 
     use super::*;
     use fs::MTime;
@@ -2687,6 +2687,80 @@ mod tests {
             assert_eq!(
                 cloned_editor.read(cx).buffer().read(cx).snapshot(cx).text(),
                 "unsaved saved contents"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_move_editor_to_workspace_window_shares_model(cx: &mut gpui::TestAppContext) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let buffer = cx.update(|cx| cx.new(|cx| Buffer::local("before move", cx)));
+        let (multi_workspace, cx) = cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let main_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let editor = cx.new_window_entity({
+            let buffer = buffer.clone();
+            let project = project.clone();
+            move |window, cx| Editor::for_buffer(buffer, Some(project), window, cx)
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx)
+        });
+
+        let auxiliary_window = workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_auxiliary_workspace_window(cx)
+            })
+            .expect("failed to open auxiliary workspace window");
+        cx.run_until_parked();
+        let (auxiliary_window_id, auxiliary_pane) = auxiliary_window
+            .update(cx, |window, _, _| (window.id(), window.pane().clone()))
+            .expect("auxiliary workspace window closed unexpectedly");
+
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_workspace_window(
+                    main_pane.clone(),
+                    editor.entity_id(),
+                    WorkspaceWindowId::Main,
+                    WorkspaceWindowId::Auxiliary(auxiliary_window_id),
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to move editor to auxiliary workspace window");
+        let moved_editor = auxiliary_pane
+            .read_with(cx, |pane, _| pane.active_item())
+            .and_then(|item| item.downcast::<Editor>())
+            .expect("auxiliary pane should contain the moved editor");
+
+        cx.update(|_, cx| {
+            assert!(
+                !main_pane
+                    .read(cx)
+                    .items()
+                    .any(|item| item.item_id() == editor.entity_id())
+            );
+            assert_ne!(moved_editor.entity_id(), editor.entity_id());
+            assert_eq!(moved_editor.read(cx).buffer(), editor.read(cx).buffer());
+            assert_eq!(moved_editor.read(cx).project(), Some(&project));
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit(
+                    [("before move".len().."before move".len(), " and after")],
+                    None,
+                    cx,
+                )
+            });
+            assert_eq!(
+                moved_editor.read(cx).buffer().read(cx).snapshot(cx).text(),
+                "before move and after"
             );
         });
     }

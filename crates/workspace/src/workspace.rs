@@ -876,6 +876,20 @@ impl WorkspaceWindows {
             })
     }
 
+    fn window_handle(&self, id: WorkspaceWindowId) -> Option<AnyWindowHandle> {
+        match id {
+            WorkspaceWindowId::Main => Some(self.main_window),
+            WorkspaceWindowId::Auxiliary(id) => {
+                let index = usize::try_from(id.number()).ok()?;
+                let AuxiliaryWindowSlot::Open(window_handle) = self.auxiliary_windows.get(index)?
+                else {
+                    return None;
+                };
+                Some(*window_handle)
+            }
+        }
+    }
+
     fn destinations(&self) -> Vec<WorkspaceWindowDestination> {
         std::iter::once(WorkspaceWindowDestination {
             id: WorkspaceWindowId::Main,
@@ -6382,9 +6396,143 @@ impl Workspace {
 
     pub fn active_pane_for_window(&self, window: &Window) -> Option<Entity<Pane>> {
         let workspace_window_id = self.workspace_window_id_for_window(window)?;
+        self.active_pane_for_workspace_window(workspace_window_id)
+    }
+
+    pub fn active_pane_for_workspace_window(
+        &self,
+        workspace_window_id: WorkspaceWindowId,
+    ) -> Option<Entity<Pane>> {
         self.active_panes_by_window
             .get(&workspace_window_id)
             .and_then(WeakEntity::upgrade)
+    }
+
+    pub fn move_item_to_workspace_window(
+        &mut self,
+        source_pane: Entity<Pane>,
+        item_id: EntityId,
+        source_window_id: WorkspaceWindowId,
+        destination_window_id: WorkspaceWindowId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        if source_window_id == destination_window_id {
+            return Task::ready(Err(anyhow!("source and destination windows are the same")));
+        }
+        if self.workspace_window_id_for_pane(&source_pane) != Some(source_window_id) {
+            return Task::ready(Err(anyhow!(
+                "source pane is not hosted by the specified workspace window"
+            )));
+        }
+
+        let Some(destination_pane) = self.active_pane_for_workspace_window(destination_window_id)
+        else {
+            return Task::ready(Err(anyhow!("destination window has no active pane")));
+        };
+        let Some(source_window_handle) = self.workspace_windows.window_handle(source_window_id)
+        else {
+            return Task::ready(Err(anyhow!("source workspace window is not open")));
+        };
+        let Some(destination_window_handle) =
+            self.workspace_windows.window_handle(destination_window_id)
+        else {
+            return Task::ready(Err(anyhow!("destination workspace window is not open")));
+        };
+
+        let Some((source_item_index, source_item)) = source_pane
+            .read(cx)
+            .items()
+            .enumerate()
+            .find(|(_, item)| item.item_id() == item_id)
+            .map(|(index, item)| (index, item.boxed_clone()))
+        else {
+            return Task::ready(Err(anyhow!("source pane no longer contains the item")));
+        };
+        if !source_item.can_move_to_window(cx) {
+            return Task::ready(Err(anyhow!("item does not support moving between windows")));
+        }
+        let transferred_tab_state = TransferredTabState {
+            pinned: source_item_index < source_pane.read(cx).pinned_count(),
+            preview: source_pane.read(cx).preview_item_id() == Some(item_id),
+        };
+        let workspace_id = self.database_id();
+
+        cx.spawn(async move |workspace, cx| {
+            let clone_task =
+                cx.update_window(destination_window_handle, |_, destination_window, cx| {
+                    source_item.clone_for_window(workspace_id, destination_window, cx)
+                })?;
+            let Some(destination_item) = clone_task.await? else {
+                return Err(anyhow!("item does not support moving between windows"));
+            };
+            let destination_item_id = destination_item.item_id();
+
+            let routing_is_unchanged = workspace.read_with(cx, |workspace, _| {
+                workspace.workspace_window_id_for_pane(&source_pane) == Some(source_window_id)
+                    && workspace.workspace_window_id_for_pane(&destination_pane)
+                        == Some(destination_window_id)
+                    && workspace
+                        .active_pane_for_workspace_window(destination_window_id)
+                        .as_ref()
+                        == Some(&destination_pane)
+            })?;
+            if !routing_is_unchanged
+                || !source_pane.read_with(cx, |pane, _| {
+                    pane.items().any(|item| item.item_id() == item_id)
+                })
+            {
+                return Err(anyhow!(
+                    "workspace window routing changed while recreating the item"
+                ));
+            }
+
+            cx.update_window(destination_window_handle, |_, destination_window, cx| {
+                destination_pane.update(cx, |pane, cx| {
+                    pane.add_transferred_item(
+                        destination_item,
+                        transferred_tab_state,
+                        destination_window,
+                        cx,
+                    )
+                })
+            })??;
+
+            let remove_result = cx.update_window(source_window_handle, |_, source_window, cx| {
+                if !source_pane
+                    .read(cx)
+                    .items()
+                    .any(|item| item.item_id() == item_id)
+                {
+                    return Err(anyhow!("source item was removed before transfer completed"));
+                }
+                source_pane.update(cx, |pane, cx| {
+                    pane.remove_item(item_id, false, false, source_window, cx)
+                });
+                Ok(())
+            });
+            if let Err(error) = remove_result.and_then(|result| result) {
+                if let Err(rollback_error) =
+                    cx.update_window(destination_window_handle, |_, destination_window, cx| {
+                        destination_pane.update(cx, |pane, cx| {
+                            pane.remove_item(
+                                destination_item_id,
+                                false,
+                                false,
+                                destination_window,
+                                cx,
+                            )
+                        });
+                    })
+                {
+                    return Err(error.context(format!(
+                        "failed to remove item from source window; destination rollback also failed: {rollback_error:#}"
+                    )));
+                }
+                return Err(error.context("failed to remove item from source window"));
+            }
+
+            Ok(())
+        })
     }
 
     pub fn focused_pane(&self, window: &Window, cx: &App) -> Entity<Pane> {
@@ -12641,6 +12789,203 @@ mod tests {
             workspace.update(cx, |workspace, _| workspace
                 .allocate_auxiliary_workspace_window_id()),
             Some(AuxiliaryWorkspaceWindowId(1))
+        );
+    }
+
+    #[gpui::test]
+    async fn test_move_item_between_workspace_windows(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let main_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        let first_auxiliary_window = workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_auxiliary_workspace_window(cx)
+            })
+            .expect("failed to open first auxiliary window");
+        let second_auxiliary_window = workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_auxiliary_workspace_window(cx)
+            })
+            .expect("failed to open second auxiliary window");
+        cx.run_until_parked();
+
+        let (first_auxiliary_id, first_auxiliary_pane) = first_auxiliary_window
+            .update(cx, |window, _, _| (window.id(), window.pane().clone()))
+            .expect("first auxiliary window closed unexpectedly");
+        let (second_auxiliary_id, second_auxiliary_pane) = second_auxiliary_window
+            .update(cx, |window, _, _| (window.id(), window.pane().clone()))
+            .expect("second auxiliary window closed unexpectedly");
+        let first_auxiliary_window_id = WorkspaceWindowId::Auxiliary(first_auxiliary_id);
+        let second_auxiliary_window_id = WorkspaceWindowId::Auxiliary(second_auxiliary_id);
+
+        let pinned_item = cx.new(|cx| TestItem::new(cx).with_label("pinned").with_window_cloning());
+        cx.update(|window, cx| {
+            main_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(pinned_item.clone()), true, true, None, window, cx);
+                pane.set_pinned_count(1);
+            });
+        });
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_workspace_window(
+                    main_pane.clone(),
+                    pinned_item.entity_id(),
+                    WorkspaceWindowId::Main,
+                    first_auxiliary_window_id,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to move pinned item from main to auxiliary window");
+
+        assert_eq!(main_pane.read_with(cx, |pane, _| pane.items_len()), 0);
+        assert_eq!(
+            first_auxiliary_pane.read_with(cx, |pane, _| pane.pinned_count()),
+            1
+        );
+        let first_clone = first_auxiliary_pane
+            .read_with(cx, |pane, _| pane.active_item())
+            .expect("first auxiliary pane should contain the cloned item");
+        assert_ne!(first_clone.item_id(), pinned_item.entity_id());
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace
+                .panes_by_item
+                .get(&first_clone.item_id())
+                .and_then(WeakEntity::upgrade)),
+            Some(first_auxiliary_pane.clone())
+        );
+        assert!(workspace.read_with(cx, |workspace, _| {
+            !workspace
+                .panes_by_item
+                .contains_key(&pinned_item.entity_id())
+        }));
+
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_workspace_window(
+                    first_auxiliary_pane.clone(),
+                    first_clone.item_id(),
+                    first_auxiliary_window_id,
+                    second_auxiliary_window_id,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to move item between auxiliary windows");
+        assert_eq!(
+            first_auxiliary_pane.read_with(cx, |pane, _| pane.items_len()),
+            0
+        );
+        assert_eq!(
+            second_auxiliary_pane.read_with(cx, |pane, _| pane.pinned_count()),
+            1
+        );
+        let second_clone = second_auxiliary_pane
+            .read_with(cx, |pane, _| pane.active_item())
+            .expect("second auxiliary pane should contain the cloned item");
+
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_workspace_window(
+                    second_auxiliary_pane.clone(),
+                    second_clone.item_id(),
+                    second_auxiliary_window_id,
+                    WorkspaceWindowId::Main,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to move item from auxiliary window to main");
+        assert_eq!(
+            second_auxiliary_pane.read_with(cx, |pane, _| pane.items_len()),
+            0
+        );
+        assert_eq!(main_pane.read_with(cx, |pane, _| pane.pinned_count()), 1);
+
+        let preview_item = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_label("preview")
+                .with_window_cloning()
+        });
+        cx.update(|window, cx| {
+            main_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(preview_item.clone()), true, true, None, window, cx);
+                pane.set_preview_item_id(Some(preview_item.entity_id()), cx);
+            });
+        });
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_workspace_window(
+                    main_pane.clone(),
+                    preview_item.entity_id(),
+                    WorkspaceWindowId::Main,
+                    first_auxiliary_window_id,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to move preview item to auxiliary window");
+        let preview_clone = first_auxiliary_pane
+            .read_with(cx, |pane, _| pane.active_item())
+            .expect("auxiliary pane should contain the preview clone");
+        assert_eq!(
+            first_auxiliary_pane.read_with(cx, |pane, _| pane.preview_item_id()),
+            Some(preview_clone.item_id())
+        );
+
+        workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_workspace_window(
+                    first_auxiliary_pane.clone(),
+                    preview_clone.item_id(),
+                    first_auxiliary_window_id,
+                    WorkspaceWindowId::Main,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to return preview item to main window");
+        assert_eq!(
+            first_auxiliary_pane.read_with(cx, |pane, _| pane.items_len()),
+            0
+        );
+
+        let failing_item = cx
+            .new(|cx| TestItem::new(cx).with_clone_for_window_error("injected recreation failure"));
+        cx.update(|window, cx| {
+            main_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(failing_item.clone()), true, true, None, window, cx)
+            });
+        });
+        let move_result = workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_workspace_window(
+                    main_pane.clone(),
+                    failing_item.entity_id(),
+                    WorkspaceWindowId::Main,
+                    first_auxiliary_window_id,
+                    cx,
+                )
+            })
+            .await;
+        let Err(error) = move_result else {
+            panic!("item recreation should have failed");
+        };
+        assert!(format!("{error:#}").contains("injected recreation failure"));
+        assert!(main_pane.read_with(cx, |pane, _| {
+            pane.items()
+                .any(|item| item.item_id() == failing_item.entity_id())
+        }));
+        assert_eq!(
+            first_auxiliary_pane.read_with(cx, |pane, _| pane.items_len()),
+            0
         );
     }
 

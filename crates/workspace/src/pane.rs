@@ -14,7 +14,7 @@ use crate::{
     toolbar::Toolbar,
     workspace_settings::{AutosaveSetting, FocusFollowsMouse, TabBarSettings, WorkspaceSettings},
 };
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use futures::{StreamExt, stream::FuturesUnordered};
 use git::{CopyFilePermalink, OpenFilePermalink};
@@ -54,6 +54,12 @@ use util::{
     ResultExt, debug_panic, markdown::MarkdownInlineCode, maybe, paths::PathStyle,
     serde::default_true, truncate_and_remove_front,
 };
+
+#[derive(Clone, Copy)]
+pub(crate) struct TransferredTabState {
+    pub pinned: bool,
+    pub preview: bool,
+}
 
 /// A selected entry in e.g. project panel.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1346,6 +1352,53 @@ impl Pane {
         }
 
         cx.emit(Event::AddItem { item });
+    }
+
+    pub(crate) fn add_transferred_item(
+        &mut self,
+        item: Box<dyn ItemHandle>,
+        state: TransferredTabState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        if state.pinned && state.preview {
+            return Err(anyhow!(
+                "a transferred tab cannot be both pinned and previewed"
+            ));
+        }
+
+        let item_id = item.item_id();
+        let project_entry_id = if item.buffer_kind(cx) == ItemBufferKind::Singleton {
+            item.project_entry_ids(cx).first().copied()
+        } else {
+            None
+        };
+        if self.items.iter().any(|existing_item| {
+            existing_item.item_id() == item_id
+                || (project_entry_id.is_some()
+                    && existing_item.buffer_kind(cx) == ItemBufferKind::Singleton
+                    && existing_item.project_entry_ids(cx).first().copied() == project_entry_id)
+        }) {
+            return Err(anyhow!("destination pane already contains this item"));
+        }
+
+        let destination_index = state.pinned.then_some(self.pinned_tab_count);
+        self.add_item(item, true, true, destination_index, window, cx);
+        let item_index = self
+            .index_for_item_id(item_id)
+            .ok_or_else(|| anyhow!("failed to insert item into destination pane"))?;
+
+        if state.pinned {
+            self.pin_tab_at(item_index, window, cx);
+        } else if state.preview {
+            self.replace_preview_item_id(item_id, window, cx);
+            let item_index = self
+                .index_for_item_id(item_id)
+                .ok_or_else(|| anyhow!("transferred preview item was removed during insertion"))?;
+            self.activate_item(item_index, true, true, window, cx);
+        }
+
+        Ok(())
     }
 
     pub fn add_item(

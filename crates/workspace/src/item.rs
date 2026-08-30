@@ -1507,6 +1507,8 @@ pub mod test {
         pub nav_history: Option<ItemNavHistory>,
         pub tab_descriptions: Option<Vec<&'static str>>,
         pub tab_detail: Cell<Option<usize>>,
+        can_move_to_window: bool,
+        clone_for_window_error: Option<String>,
         serialize: Option<Box<dyn Fn() -> Option<Task<anyhow::Result<()>>>>>,
         focus_handle: gpui::FocusHandle,
         pub child_focus_handles: Vec<gpui::FocusHandle>,
@@ -1600,6 +1602,8 @@ pub mod test {
                 nav_history: None,
                 tab_descriptions: None,
                 tab_detail: Default::default(),
+                can_move_to_window: false,
+                clone_for_window_error: None,
                 workspace_id: Default::default(),
                 focus_handle: cx.focus_handle(),
                 serialize: None,
@@ -1621,6 +1625,47 @@ pub mod test {
         pub fn with_buffer_kind(mut self, buffer_kind: ItemBufferKind) -> Self {
             self.buffer_kind = buffer_kind;
             self
+        }
+
+        pub fn with_window_cloning(mut self) -> Self {
+            self.can_move_to_window = true;
+            self
+        }
+
+        pub fn with_clone_for_window_error(mut self, error: impl Into<String>) -> Self {
+            self.can_move_to_window = true;
+            self.clone_for_window_error = Some(error.into());
+            self
+        }
+
+        fn cloned_entity(&self, cx: &mut Context<Self>) -> Entity<Self> {
+            cx.new(|cx| Self {
+                state: self.state.clone(),
+                label: self.label.clone(),
+                save_count: self.save_count,
+                save_as_count: self.save_as_count,
+                reload_count: self.reload_count,
+                is_dirty: self.is_dirty,
+                save_error: self.save_error.clone(),
+                buffer_kind: self.buffer_kind,
+                has_conflict: self.has_conflict,
+                has_deleted_file: self.has_deleted_file,
+                capability: self.capability,
+                project_items: self.project_items.clone(),
+                nav_history: None,
+                tab_descriptions: None,
+                tab_detail: Default::default(),
+                can_move_to_window: self.can_move_to_window,
+                clone_for_window_error: self.clone_for_window_error.clone(),
+                workspace_id: self.workspace_id,
+                focus_handle: cx.focus_handle(),
+                serialize: None,
+                child_focus_handles: self
+                    .child_focus_handles
+                    .iter()
+                    .map(|_| cx.focus_handle())
+                    .collect(),
+            })
         }
 
         pub fn set_has_deleted_file(&mut self, deleted: bool) {
@@ -1774,6 +1819,28 @@ pub mod test {
             true
         }
 
+        fn can_move_to_window(&self) -> bool {
+            self.can_move_to_window
+        }
+
+        fn clone_for_window(
+            &self,
+            _workspace_id: Option<WorkspaceId>,
+            _: &mut Window,
+            cx: &mut Context<Self>,
+        ) -> Task<anyhow::Result<Option<Entity<Self>>>>
+        where
+            Self: Sized,
+        {
+            if !self.can_move_to_window {
+                Task::ready(Ok(None))
+            } else if let Some(error) = self.clone_for_window_error.clone() {
+                Task::ready(Err(anyhow::anyhow!(error)))
+            } else {
+                Task::ready(Ok(Some(self.cloned_entity(cx))))
+            }
+        }
+
         fn clone_on_split(
             &self,
             _workspace_id: Option<WorkspaceId>,
@@ -1783,33 +1850,7 @@ pub mod test {
         where
             Self: Sized,
         {
-            Task::ready(Some(cx.new(|cx| {
-                Self {
-                    state: self.state.clone(),
-                    label: self.label.clone(),
-                    save_count: self.save_count,
-                    save_as_count: self.save_as_count,
-                    reload_count: self.reload_count,
-                    is_dirty: self.is_dirty,
-                    save_error: self.save_error.clone(),
-                    buffer_kind: self.buffer_kind,
-                    has_conflict: self.has_conflict,
-                    has_deleted_file: self.has_deleted_file,
-                    capability: self.capability,
-                    project_items: self.project_items.clone(),
-                    nav_history: None,
-                    tab_descriptions: None,
-                    tab_detail: Default::default(),
-                    workspace_id: self.workspace_id,
-                    focus_handle: cx.focus_handle(),
-                    serialize: None,
-                    child_focus_handles: self
-                        .child_focus_handles
-                        .iter()
-                        .map(|_| cx.focus_handle())
-                        .collect(),
-                }
-            })))
+            Task::ready(Some(self.cloned_entity(cx)))
         }
 
         fn is_dirty(&self, _: &App) -> bool {
