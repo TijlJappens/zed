@@ -855,6 +855,27 @@ impl WorkspaceWindows {
         true
     }
 
+    fn id_for_window(&self, window_handle: AnyWindowHandle) -> Option<WorkspaceWindowId> {
+        if window_handle.window_id() == self.main_window.window_id() {
+            return Some(WorkspaceWindowId::Main);
+        }
+        self.auxiliary_windows
+            .iter()
+            .enumerate()
+            .find_map(|(number, slot)| {
+                let AuxiliaryWindowSlot::Open(existing_handle) = slot else {
+                    return None;
+                };
+                if existing_handle.window_id() != window_handle.window_id() {
+                    return None;
+                }
+                let number = u64::try_from(number).ok()?;
+                Some(WorkspaceWindowId::Auxiliary(AuxiliaryWorkspaceWindowId(
+                    number,
+                )))
+            })
+    }
+
     fn destinations(&self) -> Vec<WorkspaceWindowDestination> {
         std::iter::once(WorkspaceWindowDestination {
             id: WorkspaceWindowId::Main,
@@ -1588,6 +1609,8 @@ pub struct Workspace {
     panes: Vec<Entity<Pane>>,
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
+    pane_window_ids: HashMap<EntityId, WorkspaceWindowId>,
+    active_panes_by_window: HashMap<WorkspaceWindowId, WeakEntity<Pane>>,
     workspace_windows: WorkspaceWindows,
     last_active_center_pane: Option<WeakEntity<Pane>>,
     last_active_view_id: Option<proto::ViewId>,
@@ -2057,6 +2080,12 @@ impl Workspace {
             panes: vec![center_pane.clone()],
             panes_by_item: Default::default(),
             active_pane: center_pane.clone(),
+            pane_window_ids: [(center_pane.entity_id(), WorkspaceWindowId::Main)]
+                .into_iter()
+                .collect(),
+            active_panes_by_window: [(WorkspaceWindowId::Main, center_pane.downgrade())]
+                .into_iter()
+                .collect(),
             workspace_windows: WorkspaceWindows::new(window.window_handle()),
             last_active_center_pane: Some(center_pane.downgrade()),
             last_active_view_id: None,
@@ -2969,6 +2998,14 @@ impl Workspace {
                 return Err(error);
             }
         };
+        self.pane_window_ids.insert(
+            pane.entity_id(),
+            WorkspaceWindowId::Auxiliary(auxiliary_window_id),
+        );
+        self.active_panes_by_window.insert(
+            WorkspaceWindowId::Auxiliary(auxiliary_window_id),
+            pane.downgrade(),
+        );
         self.panes.push(pane);
 
         let workspace = self.weak_handle();
@@ -4968,6 +5005,12 @@ impl Workspace {
         });
         cx.subscribe_in(&pane, window, Self::handle_pane_event)
             .detach();
+        if let Some(workspace_window_id) =
+            self.workspace_windows.id_for_window(window.window_handle())
+        {
+            self.pane_window_ids
+                .insert(pane.entity_id(), workspace_window_id);
+        }
         self.panes.push(pane.clone());
 
         window.focus(&pane.focus_handle(cx), cx);
@@ -5965,6 +6008,14 @@ impl Workspace {
     ) {
         self.flush_deferred_saves(window, cx);
 
+        if let Some(workspace_window_id) =
+            self.workspace_windows.id_for_window(window.window_handle())
+            && self.pane_window_ids.get(&pane.entity_id()) == Some(&workspace_window_id)
+        {
+            self.active_panes_by_window
+                .insert(workspace_window_id, pane.downgrade());
+        }
+
         // This is explicitly hoisted out of the following check for pane identity as
         // terminal panel panes are not registered as a center panes.
         self.status_bar.update(cx, |status_bar, cx| {
@@ -6025,7 +6076,13 @@ impl Workspace {
     ) {
         self.active_pane = pane.clone();
         self.active_item_path_changed(true, window, cx);
-        self.last_active_center_pane = Some(pane.downgrade());
+        if let Some(workspace_window_id) = self.pane_window_ids.get(&pane.entity_id()).copied() {
+            self.active_panes_by_window
+                .insert(workspace_window_id, pane.downgrade());
+        }
+        if self.pane_window_ids.get(&pane.entity_id()) == Some(&WorkspaceWindowId::Main) {
+            self.last_active_center_pane = Some(pane.downgrade());
+        }
     }
 
     fn handle_panel_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6315,6 +6372,21 @@ impl Workspace {
         &self.active_pane
     }
 
+    pub fn workspace_window_id_for_pane(&self, pane: &Entity<Pane>) -> Option<WorkspaceWindowId> {
+        self.pane_window_ids.get(&pane.entity_id()).copied()
+    }
+
+    pub fn workspace_window_id_for_window(&self, window: &Window) -> Option<WorkspaceWindowId> {
+        self.workspace_windows.id_for_window(window.window_handle())
+    }
+
+    pub fn active_pane_for_window(&self, window: &Window) -> Option<Entity<Pane>> {
+        let workspace_window_id = self.workspace_window_id_for_window(window)?;
+        self.active_panes_by_window
+            .get(&workspace_window_id)
+            .and_then(WeakEntity::upgrade)
+    }
+
     pub fn focused_pane(&self, window: &Window, cx: &App) -> Entity<Pane> {
         for dock in self.all_docks() {
             if dock.focus_handle(cx).contains_focused(window, cx)
@@ -6326,7 +6398,8 @@ impl Workspace {
                 return pane;
             }
         }
-        self.active_pane().clone()
+        self.active_pane_for_window(window)
+            .unwrap_or_else(|| self.active_pane().clone())
     }
 
     pub fn adjacent_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Pane> {
@@ -7509,6 +7582,16 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        if let Some(workspace_window_id) = self.pane_window_ids.remove(&pane.entity_id())
+            && self
+                .active_panes_by_window
+                .get(&workspace_window_id)
+                .and_then(WeakEntity::upgrade)
+                .as_ref()
+                == Some(pane)
+        {
+            self.active_panes_by_window.remove(&workspace_window_id);
+        }
         let removing_active_pane = self.active_pane() == pane;
         self.panes.retain(|p| p != pane);
         if let Some(focus_on) = focus_on {
@@ -12376,6 +12459,7 @@ mod tests {
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
         let workspace =
             multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let main_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
         let main_window_handle = cx.window_handle();
         let action_count = Rc::new(Cell::new(0));
         workspace.update(cx, {
@@ -12423,6 +12507,67 @@ mod tests {
             Err(error) => panic!("failed to resolve auxiliary workspace: {error:#}"),
         };
         assert_eq!(auxiliary_workspace_for_window, Some(workspace.clone()));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace
+                .workspace_window_id_for_pane(&main_pane)),
+            Some(WorkspaceWindowId::Main)
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace
+                .workspace_window_id_for_pane(&auxiliary_pane)),
+            Some(WorkspaceWindowId::Auxiliary(auxiliary_window_id))
+        );
+        assert_eq!(
+            cx.update(|window, cx| workspace.read(cx).active_pane_for_window(window)),
+            Some(main_pane.clone())
+        );
+        let auxiliary_active_pane = match cx
+            .update_window(auxiliary_window.into(), |_, window, cx| {
+                workspace.read(cx).active_pane_for_window(window)
+            }) {
+            Ok(pane) => pane,
+            Err(error) => panic!("failed to resolve the auxiliary active pane: {error:#}"),
+        };
+        assert_eq!(auxiliary_active_pane, Some(auxiliary_pane.clone()));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.active_pane().clone()),
+            auxiliary_pane
+        );
+
+        cx.update(|window, cx| {
+            window.focus(&main_pane.focus_handle(cx), cx);
+            main_pane.update(cx, |_, cx| cx.emit(pane::Event::Focus));
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.active_pane().clone()),
+            main_pane
+        );
+        assert_eq!(
+            match cx.update_window(auxiliary_window.into(), |_, window, cx| {
+                workspace.read(cx).active_pane_for_window(window)
+            }) {
+                Ok(pane) => pane,
+                Err(error) => panic!("failed to retain the auxiliary active pane: {error:#}"),
+            },
+            Some(auxiliary_pane.clone())
+        );
+
+        if let Err(error) = cx.update_window(auxiliary_window.into(), |_, window, cx| {
+            window.focus(&auxiliary_pane.focus_handle(cx), cx);
+            auxiliary_pane.update(cx, |_, cx| cx.emit(pane::Event::Focus));
+        }) {
+            panic!("failed to focus the auxiliary pane: {error:#}");
+        }
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.active_pane().clone()),
+            auxiliary_pane
+        );
+        assert_eq!(
+            cx.update(|window, cx| workspace.read(cx).active_pane_for_window(window)),
+            Some(main_pane.clone())
+        );
 
         if let Err(error) = cx.update_window(auxiliary_window.into(), |_, window, cx| {
             window.refresh();
