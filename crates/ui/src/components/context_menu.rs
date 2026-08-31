@@ -1611,6 +1611,10 @@ impl ContextMenu {
 
         div()
             .id(("context-menu-submenu-trigger", ix))
+            .debug_selector({
+                let label = label.clone();
+                move || format!("MENU_ITEM-{label}")
+            })
             .capture_any_mouse_down(cx.listener(move |this, event: &MouseDownEvent, _, _| {
                 // This prevents on_hover(false) from closing the submenu during a click.
                 if event.button == MouseButton::Left {

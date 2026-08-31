@@ -10,7 +10,7 @@ use crate::{
         TabContentParams, TabTooltipContent, WeakItemHandle,
     },
     move_item,
-    notifications::NotifyResultExt,
+    notifications::{DetachAndPromptErr, NotifyResultExt},
     toolbar::Toolbar,
     workspace_settings::{AutosaveSetting, FocusFollowsMouse, TabBarSettings, WorkspaceSettings},
 };
@@ -3164,6 +3164,7 @@ impl Pane {
                 let pane = pane.clone();
                 let menu_context = menu_context.clone();
                 let extra_actions = item_handle.tab_extra_context_menu_actions(window, cx);
+                let item_handle = item_handle.boxed_clone();
                 ContextMenu::build(window, cx, move |mut menu, window, cx| {
                     let close_active_item_action = CloseActiveItem {
                         save_intent: None,
@@ -3303,6 +3304,57 @@ impl Pane {
                                         }),
                                     )
                                 }
+                            })
+                        };
+                        let move_to_window_context = if item_handle.can_move_to_window(cx) {
+                            pane.read(cx).workspace.upgrade().and_then(|workspace| {
+                                let source_window_id =
+                                    workspace.read(cx).workspace_window_id_for_pane(&pane)?;
+                                let destinations =
+                                    workspace.read(cx).workspace_window_destinations();
+                                Some((workspace, source_window_id, destinations))
+                            })
+                        } else {
+                            None
+                        };
+                        let tab_organization_entries = |menu: ContextMenu| {
+                            let menu = pin_tab_entries(menu);
+                            let Some((workspace, source_window_id, destinations)) =
+                                move_to_window_context
+                            else {
+                                return menu;
+                            };
+                            let pane = pane.clone();
+                            menu.submenu("Move to Window", move |mut menu, _, _| {
+                                for destination in &destinations {
+                                    let workspace = workspace.clone();
+                                    let pane = pane.clone();
+                                    let destination_window_id = destination.id;
+                                    menu = menu.item(
+                                        ContextMenuEntry::new(destination.label.clone())
+                                            .disabled(destination_window_id == source_window_id)
+                                            .handler(move |window, cx| {
+                                                workspace
+                                                    .update(cx, |workspace, cx| {
+                                                        workspace.move_item_to_workspace_window(
+                                                            pane.clone(),
+                                                            item_id,
+                                                            source_window_id,
+                                                            destination_window_id,
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .detach_and_prompt_err(
+                                                        "Failed to move tab",
+                                                        window,
+                                                        cx,
+                                                        |error, _, _| Some(format!("{error:#}")),
+                                                    );
+                                            }),
+                                    );
+                                }
+                                menu.separator()
+                                    .item(ContextMenuEntry::new("New Window").disabled(true))
                             })
                         };
 
@@ -3471,7 +3523,7 @@ impl Pane {
                                         )
                                     })
                                 })
-                                .map(pin_tab_entries)
+                                .map(tab_organization_entries)
                                 .when(visible_in_project_panel, |menu| {
                                     menu.entry(
                                         "Reveal In Project Panel",
@@ -3504,7 +3556,7 @@ impl Pane {
                                     )
                                 });
                         } else {
-                            menu = menu.map(pin_tab_entries);
+                            menu = menu.map(tab_organization_entries);
                         }
                     };
 

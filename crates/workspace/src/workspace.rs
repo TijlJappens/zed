@@ -12990,6 +12990,179 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_move_to_window_tab_context_menu(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let main_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let auxiliary_window = workspace
+            .update(cx, |workspace, cx| {
+                workspace.open_auxiliary_workspace_window(cx)
+            })
+            .expect("failed to open auxiliary window");
+        cx.run_until_parked();
+        let auxiliary_pane = auxiliary_window
+            .update(cx, |window, _, _| window.pane().clone())
+            .expect("auxiliary window closed unexpectedly");
+
+        let clicked_item = cx.new(|cx| {
+            TestItem::new(cx)
+                .with_label("clicked")
+                .with_window_cloning()
+        });
+        let active_item = cx.new(|cx| TestItem::new(cx).with_label("active").with_window_cloning());
+        let unsupported_item = cx.new(|cx| TestItem::new(cx).with_label("unsupported"));
+        cx.update(|window, cx| {
+            window.activate_window();
+            main_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(clicked_item.clone()), true, true, None, window, cx);
+                pane.add_item(Box::new(active_item.clone()), true, true, None, window, cx);
+                pane.add_item(
+                    Box::new(unsupported_item.clone()),
+                    true,
+                    true,
+                    None,
+                    window,
+                    cx,
+                );
+            });
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        assert_eq!(
+            main_pane
+                .read_with(cx, |pane, _| pane.active_item())
+                .map(|item| item.item_id()),
+            Some(unsupported_item.entity_id())
+        );
+
+        let clicked_tab_bounds = cx
+            .debug_bounds("TAB-0")
+            .expect("clicked tab should have debug bounds");
+        cx.simulate_event(MouseDownEvent {
+            position: clicked_tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: clicked_tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        assert!(
+            cx.debug_bounds("MENU_ITEM-Close").is_some(),
+            "tab context menu should be open"
+        );
+        let move_to_window_bounds = cx
+            .debug_bounds("MENU_ITEM-Move to Window")
+            .expect("supported tab should expose Move to Window");
+        cx.simulate_click(move_to_window_bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        let main_window_bounds = cx
+            .debug_bounds("MENU_ITEM-Main Window")
+            .expect("submenu should contain Main Window");
+        let auxiliary_window_bounds = cx
+            .debug_bounds("MENU_ITEM-Window 0")
+            .expect("submenu should contain Window 0");
+        let new_window_bounds = cx
+            .debug_bounds("MENU_ITEM-New Window")
+            .expect("submenu should contain New Window");
+        assert!(main_window_bounds.center().y < auxiliary_window_bounds.center().y);
+        assert!(auxiliary_window_bounds.center().y < new_window_bounds.center().y);
+
+        cx.simulate_click(auxiliary_window_bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert!(!main_pane.read_with(cx, |pane, _| {
+            pane.items()
+                .any(|item| item.item_id() == clicked_item.entity_id())
+        }));
+        assert!(main_pane.read_with(cx, |pane, _| {
+            pane.items()
+                .any(|item| item.item_id() == active_item.entity_id())
+        }));
+        assert!(main_pane.read_with(cx, |pane, _| {
+            pane.items()
+                .any(|item| item.item_id() == unsupported_item.entity_id())
+        }));
+        assert_eq!(auxiliary_pane.read_with(cx, |pane, _| pane.items_len()), 1);
+
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let unsupported_tab_bounds = cx
+            .debug_bounds("TAB-1")
+            .expect("unsupported tab should have debug bounds");
+        cx.simulate_event(MouseDownEvent {
+            position: unsupported_tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: unsupported_tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        assert!(cx.debug_bounds("MENU_ITEM-Move to Window").is_none());
+
+        let mut auxiliary_cx = VisualTestContext::from_window(auxiliary_window.into(), &cx.cx);
+        auxiliary_cx.update(|window, cx| {
+            window.activate_window();
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let auxiliary_tab_bounds = auxiliary_cx
+            .debug_bounds("TAB-0")
+            .expect("moved tab should render in the auxiliary window");
+        auxiliary_cx.simulate_event(MouseDownEvent {
+            position: auxiliary_tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        auxiliary_cx.simulate_event(MouseUpEvent {
+            position: auxiliary_tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        let move_to_window_bounds = auxiliary_cx
+            .debug_bounds("MENU_ITEM-Move to Window")
+            .expect("moved tab should expose Move to Window");
+        auxiliary_cx.simulate_click(move_to_window_bounds.center(), Modifiers::default());
+        auxiliary_cx.run_until_parked();
+        auxiliary_cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let current_window_bounds = auxiliary_cx
+            .debug_bounds("MENU_ITEM-Window 0")
+            .expect("submenu should contain the current auxiliary window");
+        auxiliary_cx.simulate_click(current_window_bounds.center(), Modifiers::default());
+        auxiliary_cx.run_until_parked();
+        auxiliary_cx.update(|_, cx| {
+            assert_eq!(auxiliary_pane.read(cx).items_len(), 1);
+        });
+    }
+
+    #[gpui::test]
     async fn test_tab_disambiguation(cx: &mut TestAppContext) {
         init_test(cx);
 
