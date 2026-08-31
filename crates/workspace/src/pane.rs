@@ -3353,8 +3353,28 @@ impl Pane {
                                             }),
                                     );
                                 }
+                                let workspace = workspace.clone();
+                                let pane = pane.clone();
                                 menu.separator()
-                                    .item(ContextMenuEntry::new("New Window").disabled(true))
+                                    .item(ContextMenuEntry::new("New Window").handler(
+                                        move |window, cx| {
+                                            workspace
+                                                .update(cx, |workspace, cx| {
+                                                    workspace.move_item_to_new_workspace_window(
+                                                        pane.clone(),
+                                                        item_id,
+                                                        source_window_id,
+                                                        cx,
+                                                    )
+                                                })
+                                                .detach_and_prompt_err(
+                                                    "Failed to move tab to a new window",
+                                                    window,
+                                                    cx,
+                                                    |error, _, _| Some(format!("{error:#}")),
+                                                );
+                                        },
+                                    ))
                             })
                         };
 

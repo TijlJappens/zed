@@ -6535,6 +6535,56 @@ impl Workspace {
         })
     }
 
+    pub fn move_item_to_new_workspace_window(
+        &mut self,
+        source_pane: Entity<Pane>,
+        item_id: EntityId,
+        source_window_id: WorkspaceWindowId,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<WorkspaceWindowId>> {
+        if self.workspace_window_id_for_pane(&source_pane) != Some(source_window_id) {
+            return Task::ready(Err(anyhow!(
+                "source pane is not hosted by the specified workspace window"
+            )));
+        }
+        let Some(source_item) = source_pane
+            .read(cx)
+            .items()
+            .find(|item| item.item_id() == item_id)
+            .map(|item| item.boxed_clone())
+        else {
+            return Task::ready(Err(anyhow!("source pane no longer contains the item")));
+        };
+        if !source_item.can_move_to_window(cx) {
+            return Task::ready(Err(anyhow!("item does not support moving between windows")));
+        }
+
+        let auxiliary_window = match self.open_auxiliary_workspace_window(cx) {
+            Ok(auxiliary_window) => auxiliary_window,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let auxiliary_window_id = match auxiliary_window.update(cx, |window, _, _| window.id()) {
+            Ok(auxiliary_window_id) => auxiliary_window_id,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let destination_window_id = WorkspaceWindowId::Auxiliary(auxiliary_window_id);
+        let move_task = self.move_item_to_workspace_window(
+            source_pane,
+            item_id,
+            source_window_id,
+            destination_window_id,
+            cx,
+        );
+
+        cx.spawn(async move |_, cx| {
+            move_task.await?;
+            cx.update_window(auxiliary_window.into(), |_, window, _| {
+                window.activate_window();
+            })?;
+            Ok(destination_window_id)
+        })
+    }
+
     pub fn focused_pane(&self, window: &Window, cx: &App) -> Entity<Pane> {
         for dock in self.all_docks() {
             if dock.focus_handle(cx).contains_focused(window, cx)
@@ -12739,6 +12789,11 @@ mod tests {
             window.refresh();
             let _ = window.draw(cx);
         });
+        let Some(drag_handle_bounds) = auxiliary_cx.debug_bounds("AUXILIARY_WINDOW_DRAG_HANDLE")
+        else {
+            panic!("auxiliary window should have a drag handle");
+        };
+        assert_eq!(drag_handle_bounds.size.height, px(30.));
         let Some(tab_bounds) = auxiliary_cx.debug_bounds("TAB-0") else {
             panic!("auxiliary tab should have debug bounds");
         };
@@ -12990,6 +13045,159 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_move_items_to_new_workspace_windows(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) = cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let main_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        let first_item = cx.new(|cx| TestItem::new(cx).with_window_cloning());
+        cx.update(|window, cx| {
+            main_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(first_item.clone()), true, true, None, window, cx)
+            });
+        });
+        let first_window_id = workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_new_workspace_window(
+                    main_pane.clone(),
+                    first_item.entity_id(),
+                    WorkspaceWindowId::Main,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to move first item to a new window");
+        assert_eq!(
+            first_window_id,
+            WorkspaceWindowId::Auxiliary(AuxiliaryWorkspaceWindowId(0))
+        );
+        let first_pane = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.active_pane_for_workspace_window(first_window_id)
+            })
+            .expect("first auxiliary window should have an active pane");
+        assert_eq!(first_pane.read_with(cx, |pane, _| pane.items_len()), 1);
+        assert_eq!(main_pane.read_with(cx, |pane, _| pane.items_len()), 0);
+
+        let second_item = cx.new(|cx| TestItem::new(cx).with_window_cloning());
+        cx.update(|window, cx| {
+            main_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(second_item.clone()), true, true, None, window, cx)
+            });
+        });
+        let second_window_id = workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_new_workspace_window(
+                    main_pane.clone(),
+                    second_item.entity_id(),
+                    WorkspaceWindowId::Main,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to move second item to a new window");
+        assert_eq!(
+            second_window_id,
+            WorkspaceWindowId::Auxiliary(AuxiliaryWorkspaceWindowId(1))
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace
+                .workspace_window_destinations()
+                .into_iter()
+                .map(|destination| destination.label)
+                .collect::<Vec<_>>()),
+            vec!["Main Window", "Window 0", "Window 1"]
+        );
+
+        for destination in workspace.read_with(cx, |workspace, _| {
+            workspace
+                .workspace_window_destinations()
+                .into_iter()
+                .skip(1)
+                .collect::<Vec<_>>()
+        }) {
+            let auxiliary_window = destination
+                .window_handle
+                .downcast::<AuxiliaryWorkspaceWindow>()
+                .expect("auxiliary destination should have the expected root type");
+            assert_eq!(
+                auxiliary_window
+                    .update(cx, |window, _, cx| window.project(cx))
+                    .expect("auxiliary window closed unexpectedly"),
+                Some(project.clone())
+            );
+        }
+
+        let failing_item = cx
+            .new(|cx| TestItem::new(cx).with_clone_for_window_error("injected recreation failure"));
+        cx.update(|window, cx| {
+            main_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(failing_item.clone()), true, true, None, window, cx)
+            });
+        });
+        let move_result = workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_new_workspace_window(
+                    main_pane.clone(),
+                    failing_item.entity_id(),
+                    WorkspaceWindowId::Main,
+                    cx,
+                )
+            })
+            .await;
+        let Err(error) = move_result else {
+            panic!("injected item recreation should fail");
+        };
+        assert!(format!("{error:#}").contains("injected recreation failure"));
+        assert!(main_pane.read_with(cx, |pane, _| {
+            pane.items()
+                .any(|item| item.item_id() == failing_item.entity_id())
+        }));
+        let failed_window_id = WorkspaceWindowId::Auxiliary(AuxiliaryWorkspaceWindowId(2));
+        let failed_pane = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.active_pane_for_workspace_window(failed_window_id)
+            })
+            .expect("failed move should leave its empty auxiliary window registered");
+        assert_eq!(failed_pane.read_with(cx, |pane, _| pane.items_len()), 0);
+
+        let unsupported_item = cx.new(TestItem::new);
+        cx.update(|window, cx| {
+            main_pane.update(cx, |pane, cx| {
+                pane.add_item(
+                    Box::new(unsupported_item.clone()),
+                    true,
+                    true,
+                    None,
+                    window,
+                    cx,
+                )
+            });
+        });
+        let window_count = cx.update(|_, cx| cx.windows().len());
+        let unsupported_result = workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_new_workspace_window(
+                    main_pane.clone(),
+                    unsupported_item.entity_id(),
+                    WorkspaceWindowId::Main,
+                    cx,
+                )
+            })
+            .await;
+        assert!(unsupported_result.is_err());
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), window_count);
+    }
+
+    #[gpui::test]
     async fn test_move_to_window_tab_context_menu(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -13160,6 +13368,79 @@ mod tests {
         auxiliary_cx.update(|_, cx| {
             assert_eq!(auxiliary_pane.read(cx).items_len(), 1);
         });
+    }
+
+    #[gpui::test]
+    async fn test_new_window_tab_context_menu(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let main_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let item = cx.new(|cx| TestItem::new(cx).with_window_cloning());
+        cx.update(|window, cx| {
+            main_pane.update(cx, |pane, cx| {
+                pane.add_item(Box::new(item.clone()), true, true, None, window, cx)
+            });
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+
+        let tab_bounds = cx
+            .debug_bounds("TAB-0")
+            .expect("source tab should have debug bounds");
+        cx.simulate_event(MouseDownEvent {
+            position: tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        cx.simulate_event(MouseUpEvent {
+            position: tab_bounds.center(),
+            button: MouseButton::Right,
+            modifiers: Modifiers::default(),
+            click_count: 1,
+        });
+        let move_to_window_bounds = cx
+            .debug_bounds("MENU_ITEM-Move to Window")
+            .expect("supported tab should expose Move to Window");
+        cx.simulate_click(move_to_window_bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            let _ = window.draw(cx);
+        });
+        let new_window_bounds = cx
+            .debug_bounds("MENU_ITEM-New Window")
+            .expect("submenu should contain New Window");
+        cx.simulate_click(new_window_bounds.center(), Modifiers::default());
+        cx.run_until_parked();
+
+        assert_eq!(cx.update(|_, cx| cx.windows().len()), 2);
+        assert_eq!(main_pane.read_with(cx, |pane, _| pane.items_len()), 0);
+        let destination_window_id = WorkspaceWindowId::Auxiliary(AuxiliaryWorkspaceWindowId(0));
+        let destination_pane = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.active_pane_for_workspace_window(destination_window_id)
+            })
+            .expect("new auxiliary window should have an active pane");
+        assert_eq!(
+            destination_pane.read_with(cx, |pane, _| pane.items_len()),
+            1
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace
+                .workspace_window_destinations()
+                .into_iter()
+                .map(|destination| destination.label)
+                .collect::<Vec<_>>()),
+            vec!["Main Window", "Window 0"]
+        );
     }
 
     #[gpui::test]

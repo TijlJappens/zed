@@ -2766,6 +2766,69 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_move_editor_to_new_workspace_window_preserves_unsaved_edits(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx, |_| {});
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let buffer = cx.update(|cx| {
+            let buffer = cx.new(|cx| Buffer::local("saved", cx));
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(5..5, " and unsaved")], None, cx)
+            });
+            buffer
+        });
+        let (multi_workspace, cx) = cx.add_window_view({
+            let project = project.clone();
+            move |window, cx| MultiWorkspace::test_new(project, window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let main_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let editor = cx.new_window_entity({
+            let buffer = buffer.clone();
+            let project = project.clone();
+            move |window, cx| Editor::for_buffer(buffer, Some(project), window, cx)
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, true, window, cx)
+        });
+
+        let destination_window_id = workspace
+            .update(cx, |workspace, cx| {
+                workspace.move_item_to_new_workspace_window(
+                    main_pane.clone(),
+                    editor.entity_id(),
+                    WorkspaceWindowId::Main,
+                    cx,
+                )
+            })
+            .await
+            .expect("failed to move editor to a new workspace window");
+        let destination_pane = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.active_pane_for_workspace_window(destination_window_id)
+            })
+            .expect("new workspace window should have an active pane");
+        let moved_editor = destination_pane
+            .read_with(cx, |pane, _| pane.active_item())
+            .and_then(|item| item.downcast::<Editor>())
+            .expect("new workspace window should contain the moved editor");
+
+        cx.update(|_, cx| {
+            assert_eq!(moved_editor.read(cx).buffer(), editor.read(cx).buffer());
+            assert_eq!(moved_editor.read(cx).project(), Some(&project));
+            assert_eq!(
+                moved_editor.read(cx).buffer().read(cx).snapshot(cx).text(),
+                "saved and unsaved"
+            );
+        });
+        assert_eq!(main_pane.read_with(cx, |pane, _| pane.items_len()), 0);
+    }
+
+    #[gpui::test]
     async fn test_suggested_filename_uses_language_extension_for_untitled_buffer(
         cx: &mut gpui::TestAppContext,
     ) {

@@ -1,5 +1,5 @@
 use crate::{AuxiliaryWorkspaceWindowId, Event as WorkspaceEvent, Pane, Workspace};
-use gpui::{App, Context, Entity, Render, Subscription, WeakEntity, Window};
+use gpui::{App, Context, Entity, MouseButton, Render, Subscription, WeakEntity, Window};
 use project::Project;
 use ui::prelude::*;
 
@@ -68,15 +68,35 @@ impl AuxiliaryWorkspaceWindow {
     pub fn id(&self) -> AuxiliaryWorkspaceWindowId {
         self.id
     }
+
+    fn drag_handle(&self, cx: &App) -> impl IntoElement {
+        div()
+            .id(("auxiliary-window-drag-handle", self.id.number()))
+            .debug_selector(|| "AUXILIARY_WINDOW_DRAG_HANDLE".to_owned())
+            .h(px(30.))
+            .w_full()
+            .flex_none()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .bg(cx.theme().colors().title_bar_background)
+            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                window.start_window_move();
+            })
+    }
+
+    fn pane_container(&self) -> Div {
+        div().flex_1().min_h_0().w_full().child(self.pane.clone())
+    }
 }
 
 impl Render for AuxiliaryWorkspaceWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.workspace_integration_ready {
-            return div()
+            return v_flex()
                 .id(("auxiliary-workspace-window", self.id.number()))
                 .size_full()
-                .child(self.pane.clone())
+                .child(self.drag_handle(cx))
+                .child(self.pane_container())
                 .into_any_element();
         }
         let Some(workspace) = self.workspace.upgrade() else {
@@ -84,7 +104,7 @@ impl Render for AuxiliaryWorkspaceWindow {
         };
         let workspace_key_context =
             workspace.read_with(cx, |workspace, cx| workspace.key_context(cx));
-        let root = workspace.update(cx, |workspace, cx| workspace.actions(h_flex(), window, cx));
+        let root = workspace.update(cx, |workspace, cx| workspace.actions(v_flex(), window, cx));
 
         root.id(("auxiliary-workspace-window", self.id.number()))
             .key_context(workspace_key_context)
@@ -92,7 +112,8 @@ impl Render for AuxiliaryWorkspaceWindow {
             .size_full()
             .font(theme_settings::setup_ui_font(window, cx))
             .text_color(cx.theme().colors().text)
-            .child(self.pane.clone())
+            .child(self.drag_handle(cx))
+            .child(self.pane_container())
             .into_any_element()
     }
 }
